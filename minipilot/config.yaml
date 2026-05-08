@@ -1,0 +1,47 @@
+# =============================================================================
+# tiny_steervit config
+# CLI 引数が常に優先。未指定の場合にここの値が使われる。
+# =============================================================================
+
+# ── Paths ────────────────────────────────────────────────────────────────────
+paths:
+  coco_root:    "/data2/kato/dataset/coco"
+  vg_root:      "/data2/kato/dataset/vg"
+  gqa_root:     "/data2/kato/dataset/GQA"
+  steervit_ckpt: "/home/kato/.cache/huggingface/hub/models--JonaRuthardt--SteerViT/snapshots/cdc29ddb5ddb8cfb6c0194c461eba14309b5afc7/steervit_dinov2_base.pth"
+
+# ── Training ─────────────────────────────────────────────────────────────────
+train:
+  teacher:               "steervit"   # steervit | bbox | both
+  text_encoder:          "distilroberta"  # distilroberta | tinybert-l6 | tinybert-l4 | minilm-l6
+  no_pretrained_backbone: false
+  dataset:               "refcoco"    # refcoco | refcoco+ | refcocog | vg | gqa | coco | all
+  epochs:                50
+  batch_size:            64
+  lr:                    3.0e-4
+  weight_decay:          1.0e-2
+  num_workers:           8
+  max_train:             null
+  max_val:               null
+  out:                   "./ckpts"
+  resume:                null
+  amp:                   true
+  seed:                  42
+  vis_every:             5
+  vis_n:                 4
+  vis_samples:           null
+  attn_distil:           false
+  attn_weight:           1.0
+  sa_weight:             1.0
+  ca_weight:             1.0
+
+# ── Test / Evaluation ────────────────────────────────────────────────────────
+test:
+  ckpt:            null             # 必須: TinySteerViT チェックポイントパス
+  split:           null             # val | testA | testB (null = 全 split)
+  dataset:         "refcoco"        # refcoco | refcoco+ | refcocog | vg | gqa
+  max_samples:     null
+  batch_size:      64
+  num_workers:     4
+  no_steervit:     false
+  no_wrong_prompt: false
