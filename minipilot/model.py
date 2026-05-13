@@ -33,7 +33,38 @@ TINY_VIT_IMG_SIZE = 224
 TINY_VIT_GRID     = 14   # 14×14 = 196 patches (16px patch / 224px)
 TINY_VIT_DIM      = 192  # ViT-Tiny embed_dim
 
+FASTVIT_T8_MODEL      = "fastvit_t8.apple_dist_in1k"
+FASTVIT_T8_IMG_SIZE   = 256
+FASTVIT_T8_GRID       = 8    # 8×8 = 64 patches (stride 32 / 256px)
+FASTVIT_T8_DIM        = 768  # final embed_dim (after final_conv)
+FASTVIT_T8_EMBED_DIMS = (48, 96, 192, 384)  # per-stage dims (before final_conv)
+
+MOBILEVIT_XXS_MODEL      = "mobilevit_xxs"
+MOBILEVIT_XXS_IMG_SIZE   = 256
+MOBILEVIT_XXS_GRID       = 8    # 8×8 = 64 patches (stride 32 / 256px)
+MOBILEVIT_XXS_DIM        = 320  # final embed_dim (after final_conv)
+MOBILEVIT_XXS_EMBED_DIMS = (16, 24, 48, 64, 80)  # per-stage dims (5 stages)
+
 D_TEXT_DISTILROBERTA = 768   # 後方互換用
+
+# ─── Vision encoder registry ─────────────────────────────────────────────────
+VISION_ENCODERS: dict[str, dict] = {
+    "vit_tiny": {
+        "img_size": TINY_VIT_IMG_SIZE,
+        "grid":     TINY_VIT_GRID,
+        "dim":      TINY_VIT_DIM,
+    },
+    "fastvit_t8": {
+        "img_size": FASTVIT_T8_IMG_SIZE,
+        "grid":     FASTVIT_T8_GRID,
+        "dim":      FASTVIT_T8_DIM,
+    },
+    "mobilevit_xxs": {
+        "img_size": MOBILEVIT_XXS_IMG_SIZE,
+        "grid":     MOBILEVIT_XXS_GRID,
+        "dim":      MOBILEVIT_XXS_DIM,
+    },
+}
 
 # ─── Text encoder registry ────────────────────────────────────────────────────
 # key: --text-encoder の値  →  hf_id: HuggingFace model ID,  d_text: hidden_size
@@ -145,10 +176,10 @@ class TinyViTBackbone(nn.Module):
                 orig_fwd = block.attn.forward
                 block.attn.forward = types.MethodType(_student_sa_capture, block.attn)
                 x = block(x)
-                sa_maps.append(block.attn._captured_sa.detach())
+                sa_maps.append(block.attn._captured_sa)  # keep in graph: grad flows through x to GCA
                 block.attn.forward = orig_fwd
                 x, ca_w = ca(x, text_feats, return_attn=True)
-                ca_maps.append(ca_w.detach())
+                ca_maps.append(ca_w)  # keep in graph: grad trains GCA directly
             else:
                 x = block(x)
                 x = ca(x, text_feats)
@@ -159,27 +190,114 @@ class TinyViTBackbone(nn.Module):
         return x
 
 
+# ─── _StemStageBackbone (共通基底: FastViT / MobileViT スタイル) ──────────────
+class _StemStageBackbone(nn.Module):
+    """
+    stem + stages + final_conv 構造を持つモデル用の共通バックボーン。
+    (FastViT-T8, MobileViT-xxs など)
+
+    各ステージの後に GatedCrossAttn を挿入し、最後に final_conv を適用する。
+    num_prefix_tokens = 0 (CLS トークンなし)
+    出力: (B, grid**2, final_dim)
+    """
+
+    def __init__(
+        self,
+        model_name:  str,
+        embed_dims:  tuple[int, ...],
+        final_dim:   int,
+        pretrained:  bool = True,
+    ):
+        super().__init__()
+        import timm
+        self.trunk = timm.create_model(model_name, pretrained=pretrained, num_classes=0)
+        self.trunk.num_prefix_tokens = 0
+        self.trunk.embed_dim = final_dim
+        # One GCA per stage; d_kv=final_dim (connector が final_dim 次元に射影)
+        self.gated_cross_attn = nn.ModuleList([
+            GatedCrossAttn(d_model=d, d_kv=final_dim)
+            for d in embed_dims
+        ])
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        text_feats: torch.Tensor,
+        attn_mask=None,
+        return_attn: bool = False,
+    ) -> torch.Tensor | tuple:
+        t = self.trunk
+        x = t.stem(x)
+
+        ca_maps: list | None = [] if return_attn else None
+
+        for stage, ca in zip(t.stages, self.gated_cross_attn):
+            x = stage(x)                              # (B, C_i, H_i, W_i)
+            B, C, H, W = x.shape
+            x_flat = x.flatten(2).transpose(1, 2)    # (B, H*W, C_i)
+            if return_attn:
+                x_flat, ca_w = ca(x_flat, text_feats, return_attn=True)
+                ca_maps.append(ca_w)  # keep in graph: grad trains GCA directly
+            else:
+                x_flat = ca(x_flat, text_feats)
+            x = x_flat.transpose(1, 2).reshape(B, C, H, W)
+
+        x = t.final_conv(x)                          # (B, final_dim, H', W')
+        x_out = x.flatten(2).transpose(1, 2)         # (B, grid**2, final_dim)
+
+        if return_attn:
+            return x_out, [], ca_maps  # SA maps なし
+        return x_out
+
+
+# ─── FastViTBackbone ──────────────────────────────────────────────────────────
+class FastViTBackbone(_StemStageBackbone):
+    """fastvit_t8: 4 stages, output (B, 64, 768)"""
+
+    def __init__(self, pretrained: bool = True):
+        super().__init__(
+            model_name = FASTVIT_T8_MODEL,
+            embed_dims = FASTVIT_T8_EMBED_DIMS,
+            final_dim  = FASTVIT_T8_DIM,
+            pretrained = pretrained,
+        )
+
+
+# ─── MobileViTXXSBackbone ─────────────────────────────────────────────────────
+class MobileViTXXSBackbone(_StemStageBackbone):
+    """mobilevit_xxs: 5 stages, output (B, 64, 320)"""
+
+    def __init__(self, pretrained: bool = True):
+        super().__init__(
+            model_name = MOBILEVIT_XXS_MODEL,
+            embed_dims = MOBILEVIT_XXS_EMBED_DIMS,
+            final_dim  = MOBILEVIT_XXS_DIM,
+            pretrained = pretrained,
+        )
+
+
 # ─── TinySteerViT ─────────────────────────────────────────────────────────────
 class TinySteerViT(nn.Module):
     """
-    SteerViT-compatible model with vit_tiny_patch16_224 backbone.
+    SteerViT-compatible model with pluggable vision backbone.
 
     学習対象: connector, gated_cross_attn, lin_seg_head。
-    凍結:     vision_model.trunk (ViT-Tiny), text_model
+    凍結:     vision_model.trunk, text_model
 
-    text_encoder: TEXT_ENCODERS のキー (例: "distilroberta", "tinybert-l4", …)
+    vision_encoder: VISION_ENCODERS のキー ("vit_tiny" | "fastvit_t8")
+    text_encoder:   TEXT_ENCODERS のキー (例: "distilroberta", "tinybert-l4", …)
 
     SteerViT と同一インターフェース:
-      .vision_model.trunk.num_prefix_tokens : 1
-      .num_img_tokens                       : 196
-      .lin_seg_head                         : Linear(192, 1)
-      .forward(images, texts) → (B, 197, 192)
+      .vision_model.trunk.num_prefix_tokens : 1 (vit_tiny) / 0 (fastvit_t8)
+      .num_img_tokens                       : 196 (vit_tiny) / 64 (fastvit_t8)
+      .lin_seg_head                         : Linear(d_vis, 1)
     """
 
     def __init__(
         self,
         pretrained_backbone: bool = True,
         text_encoder: str = "distilroberta",
+        vision_encoder: str = "vit_tiny",
     ):
         super().__init__()
         if text_encoder not in TEXT_ENCODERS:
@@ -187,16 +305,32 @@ class TinySteerViT(nn.Module):
                 f"Unknown text_encoder {text_encoder!r}. "
                 f"Choose from {list(TEXT_ENCODERS)}"
             )
+        if vision_encoder not in VISION_ENCODERS:
+            raise ValueError(
+                f"Unknown vision_encoder {vision_encoder!r}. "
+                f"Choose from {list(VISION_ENCODERS)}"
+            )
         enc_cfg = TEXT_ENCODERS[text_encoder]
         d_text  = enc_cfg["d_text"]
         hf_id   = enc_cfg["hf_id"]
+        vis_cfg = VISION_ENCODERS[vision_encoder]
 
-        self.text_encoder_name = text_encoder
-        self.vision_model      = TinyViTBackbone(pretrained=pretrained_backbone)
-        d_vis                  = self.vision_model.trunk.embed_dim  # 192
+        self.text_encoder_name   = text_encoder
+        self.vision_encoder_name = vision_encoder
+        self.img_size            = vis_cfg["img_size"]
+        self.grid_size           = vis_cfg["grid"]
+
+        _backbone_cls = {
+            "vit_tiny":      TinyViTBackbone,
+            "fastvit_t8":    FastViTBackbone,
+            "mobilevit_xxs": MobileViTXXSBackbone,
+        }
+        self.vision_model = _backbone_cls[vision_encoder](pretrained=pretrained_backbone)
+
+        d_vis                  = self.vision_model.trunk.embed_dim
         self.connector         = nn.Linear(d_text, d_vis)
         self.lin_seg_head      = nn.Linear(d_vis, 1)
-        self.num_img_tokens    = TINY_VIT_GRID ** 2   # 196
+        self.num_img_tokens    = vis_cfg["grid"] ** 2
 
         from transformers import AutoTokenizer, AutoModel
         self.tokenizer  = AutoTokenizer.from_pretrained(hf_id)
@@ -210,7 +344,7 @@ class TinySteerViT(nn.Module):
         texts: list[str],
         return_attn: bool = False,
     ) -> torch.Tensor | tuple:
-        """Full forward → (B, 197, 192), or tuple with attn maps when return_attn=True."""
+        """Full forward → (B, N+prefix, d_vis), or tuple with attn maps when return_attn=True."""
         device = images.device
         tok = self.tokenizer(
             texts, padding=True, truncation=True,
@@ -220,7 +354,7 @@ class TinySteerViT(nn.Module):
         with torch.no_grad():
             text_out = self.text_model(**tok)
         text_seq   = text_out.last_hidden_state          # (B, L, d_text)
-        text_feats = self.connector(text_seq)             # (B, L, 192)
+        text_feats = self.connector(text_seq)             # (B, L, d_vis)
         return self.vision_model(images, text_feats, return_attn=return_attn)
 
 
@@ -253,6 +387,76 @@ def bbox_to_patch_dist(
 
     area = (overlap_x * overlap_y).reshape(B, g * g)                       # (B, g*g)
     return area / area.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+
+
+# ─── TeacherCache ─────────────────────────────────────────────────────────────
+class TeacherCache:
+    """
+    事前計算済み SteerViT 教師出力を保持する numpy memmap ベースのキャッシュ。
+
+    キャッシュディレクトリ構成:
+      meta.json  - メタデータ (n_samples, teacher_grid, n_blocks, ca_valid, ...)
+      soft.dat   - (N, T) float16 memmap  T = teacher_grid**2
+      sa.dat     - (N, B, T) float16 memmap  (attn=True 時のみ)
+      ca.dat     - (N, B, T) float16 memmap  (attn=True 時のみ)
+
+    SA/CA はヘッド平均・正規化済み分布として格納する:
+      SA[i]: CLS→patch 注意の head 平均・正規化 (576,) per block
+      CA[i]: patch→text 注意の head 平均・text 平均・正規化 (576,) per block (blocks with CA)
+    """
+
+    def __init__(self, cache_dir: str):
+        import json, os
+        import numpy as np
+        self._np = np
+        meta_path = os.path.join(cache_dir, "meta.json")
+        if not os.path.exists(meta_path):
+            raise FileNotFoundError(f"Teacher cache not found: {meta_path}")
+        with open(meta_path, encoding="utf-8") as f:
+            self.meta = json.load(f)
+
+        N   = self.meta["n_samples"]
+        T   = self.meta["teacher_grid"] ** 2
+        B   = self.meta["n_blocks"]
+        self.teacher_grid = self.meta["teacher_grid"]
+        self.ca_valid     = self.meta["ca_valid"]  # list[bool] length B
+
+        self.soft = np.memmap(
+            os.path.join(cache_dir, "soft.dat"), dtype="float16", mode="r", shape=(N, T)
+        )
+        sa_path = os.path.join(cache_dir, "sa.dat")
+        if os.path.exists(sa_path):
+            self.sa = np.memmap(sa_path, dtype="float16", mode="r", shape=(N, B, T))
+            self.ca = np.memmap(
+                os.path.join(cache_dir, "ca.dat"), dtype="float16", mode="r", shape=(N, B, T)
+            )
+            self.has_attn = True
+        else:
+            self.sa = self.ca = None
+            self.has_attn = False
+
+    def get_soft(self, indices: list[int], device) -> torch.Tensor:
+        arr = self._np.array(self.soft[indices], dtype=self._np.float32)
+        return torch.from_numpy(arr).to(device)
+
+    def get_attn(self, indices: list[int], device) -> tuple[list, list]:
+        """
+        Returns (sa_maps, ca_maps) with compressed distributions:
+          sa_maps[i]: (B_batch, T) float32 tensor  or None
+          ca_maps[i]: (B_batch, T) float32 tensor  or None
+        AttnDistilLoss._sa_loss/_ca_loss detects dim()==2 and treats as pre-computed.
+        """
+        if not self.has_attn:
+            raise RuntimeError("このキャッシュには SA/CA データが含まれていません (--no-attn で作成)")
+        sa_arr = self._np.array(self.sa[indices], dtype=self._np.float32)  # (B, n_blocks, T)
+        ca_arr = self._np.array(self.ca[indices], dtype=self._np.float32)
+        n_blocks = sa_arr.shape[1]
+        sa_maps = [torch.from_numpy(sa_arr[:, i, :]).to(device) for i in range(n_blocks)]
+        ca_maps = [
+            torch.from_numpy(ca_arr[:, i, :]).to(device) if self.ca_valid[i] else None
+            for i in range(n_blocks)
+        ]
+        return sa_maps, ca_maps
 
 
 # ─── Attention distillation helpers ──────────────────────────────────────────
@@ -346,17 +550,21 @@ class AttnDistilLoss(nn.Module):
 
     def _sa_loss(
         self,
-        sa_t: list,  # list[(B, H_t, N_t+1, N_t+1) or None]
+        sa_t: list,  # list[(B, H_t, N_t+1, N_t+1) | (B, tg*tg) | None]
         sa_s: list,  # list[(B, H_s, N_s+1, N_s+1)]
     ) -> torch.Tensor:
         total, count = 0.0, 0
         for t_map, s_map in zip(sa_t, sa_s):
             if t_map is None:
                 continue
-            # CLS→patch, head average
-            t_vec = t_map[:, :, 0, self.num_prefix_t:].mean(dim=1)   # (B, N_t)
-            s_vec = s_map[:, :, 0, self.num_prefix_s:].mean(dim=1)   # (B, N_s)
-            t_soft = t_vec / t_vec.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+            if t_map.dim() == 2:
+                # 事前計算済み: (B, tg*tg) 正規化済み分布
+                t_soft = t_map
+            else:
+                # 生の注意マップ: (B, H, N+1, N+1)
+                t_vec  = t_map[:, :, 0, self.num_prefix_t:].mean(dim=1)
+                t_soft = t_vec / t_vec.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+            s_vec  = s_map[:, :, 0, self.num_prefix_s:].mean(dim=1)
             s_soft = s_vec / s_vec.sum(dim=-1, keepdim=True).clamp(min=1e-8)
             t_soft = self._align(t_soft)
             total += self._kl(t_soft, s_soft)
@@ -365,17 +573,21 @@ class AttnDistilLoss(nn.Module):
 
     def _ca_loss(
         self,
-        ca_t: list,  # list[(B, H_t, N_t+1, L_t) or None]
+        ca_t: list,  # list[(B, H_t, N_t+1, L_t) | (B, tg*tg) | None]
         ca_s: list,  # list[(B, H_s, N_s+1, L_s)]
     ) -> torch.Tensor:
         total, count = 0.0, 0
         for t_map, s_map in zip(ca_t, ca_s):
             if t_map is None:
                 continue
-            # patch tokens only, head avg then text-token avg
-            t_vec = t_map[:, :, self.num_prefix_t:, :].mean(dim=1).mean(dim=-1)  # (B, N_t)
-            s_vec = s_map[:, :, self.num_prefix_s:, :].mean(dim=1).mean(dim=-1)  # (B, N_s)
-            t_soft = t_vec / t_vec.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+            if t_map.dim() == 2:
+                # 事前計算済み: (B, tg*tg) 正規化済み分布
+                t_soft = t_map
+            else:
+                # 生の注意マップ: (B, H, N+1, L)
+                t_vec  = t_map[:, :, self.num_prefix_t:, :].mean(dim=1).mean(dim=-1)
+                t_soft = t_vec / t_vec.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+            s_vec  = s_map[:, :, self.num_prefix_s:, :].mean(dim=1).mean(dim=-1)
             s_soft = s_vec / s_vec.sum(dim=-1, keepdim=True).clamp(min=1e-8)
             t_soft = self._align(t_soft)
             total += self._kl(t_soft, s_soft)
@@ -428,19 +640,21 @@ class HeatmapSoftCELoss(nn.Module):
     def __init__(
         self,
         sv,
-        sv_teacher,                        # "bbox" モード時は None 可
-        grid_size:         int   = TINY_VIT_GRID,
-        teacher_grid_size: int   = STEERVIT_GRID,
-        teacher_img_size:  int   = STEERVIT_IMG_SIZE,
-        teacher_mode:      str   = "steervit",   # "steervit" | "bbox" | "both"
-        attn_weight:       float = 0.0,          # 0 で attn distil 無効
-        sa_weight:         float = 1.0,          # SA loss の重み
-        ca_weight:         float = 1.0,          # CA loss の重み
+        sv_teacher,                        # "bbox" / cache モード時は None 可
+        grid_size:         int            = TINY_VIT_GRID,
+        teacher_grid_size: int            = STEERVIT_GRID,
+        teacher_img_size:  int            = STEERVIT_IMG_SIZE,
+        teacher_mode:      str            = "steervit",  # "steervit" | "bbox" | "both"
+        attn_weight:       float          = 0.0,
+        sa_weight:         float          = 1.0,
+        ca_weight:         float          = 1.0,
+        teacher_cache:     "TeacherCache | None" = None,  # 事前計算済みキャッシュ
     ):
         assert teacher_mode in ("steervit", "bbox", "both")
         super().__init__()
         self.sv                = sv
         self.sv_teacher        = sv_teacher
+        self.teacher_cache     = teacher_cache
         self.grid_size         = grid_size
         self.teacher_grid_size = teacher_grid_size
         self.teacher_img_size  = teacher_img_size
@@ -451,17 +665,21 @@ class HeatmapSoftCELoss(nn.Module):
         self.num_prefix        = sv.vision_model.trunk.num_prefix_tokens
         if sv_teacher is not None:
             self.teacher_num_prefix = sv_teacher.vision_model.trunk.num_prefix_tokens
+        elif teacher_cache is not None:
+            self.teacher_num_prefix = teacher_cache.meta.get("teacher_num_prefix", 1)
         else:
             self.teacher_num_prefix = 1
 
         self.attn_distil: AttnDistilLoss | None = None
-        if attn_weight > 0.0 and sv_teacher is not None and teacher_mode in ("steervit", "both"):
-            self.attn_distil = AttnDistilLoss(
-                teacher_grid=teacher_grid_size,
-                student_grid=grid_size,
-                num_prefix_t=self.teacher_num_prefix,
-                num_prefix_s=self.num_prefix,
-            )
+        use_cache_attn = teacher_cache is not None and teacher_cache.has_attn
+        if attn_weight > 0.0 and teacher_mode in ("steervit", "both"):
+            if sv_teacher is not None or use_cache_attn:
+                self.attn_distil = AttnDistilLoss(
+                    teacher_grid=teacher_grid_size,
+                    student_grid=grid_size,
+                    num_prefix_t=self.teacher_num_prefix,
+                    num_prefix_s=self.num_prefix,
+                )
 
         # 最後の forward で記録する内訳 (ログ用)
         self.last_heatmap_loss: float = 0.0
@@ -498,14 +716,28 @@ class HeatmapSoftCELoss(nn.Module):
 
     def forward(
         self,
-        full_imgs: torch.Tensor,          # (B, 3, H, W)
-        texts:     list[str],
-        bboxes:    torch.Tensor | None = None,  # (B, 4) [x1,y1,x2,y2] in [0,1]
+        full_imgs:  torch.Tensor,                    # (B, 3, H, W)
+        texts:      list[str],
+        bboxes:     torch.Tensor | None = None,      # (B, 4) [x1,y1,x2,y2] in [0,1]
+        sample_ids: list[int]    | None = None,      # キャッシュインデックス
     ) -> torch.Tensor:
-        use_attn = self.attn_distil is not None
+        use_attn  = self.attn_distil is not None
+        use_cache = self.teacher_cache is not None and sample_ids is not None
+        device    = full_imgs.device
 
         with torch.no_grad():
-            if self.teacher_mode == "steervit":
+            if use_cache and self.teacher_mode in ("steervit", "both"):
+                # ─ キャッシュから教師出力をロード ────────────────────────────
+                raw_soft = self.teacher_cache.get_soft(sample_ids, device)
+                teacher_soft = self._adapt_steervit(raw_soft)
+                if use_attn:
+                    sa_t, ca_t = self.teacher_cache.get_attn(sample_ids, device)
+                if self.teacher_mode == "both":
+                    assert bboxes is not None, "both モードには bboxes が必要"
+                    bbox_soft    = bbox_to_patch_dist(bboxes.to(device), self.grid_size)
+                    teacher_soft = 0.5 * (teacher_soft + bbox_soft)
+
+            elif self.teacher_mode == "steervit":
                 if use_attn:
                     raw_soft, sa_t, ca_t = _teacher_forward_collect(
                         self.sv_teacher, full_imgs, texts,
@@ -518,7 +750,7 @@ class HeatmapSoftCELoss(nn.Module):
             elif self.teacher_mode == "bbox":
                 assert bboxes is not None, "bbox モードには bboxes が必要"
                 teacher_soft = bbox_to_patch_dist(
-                    bboxes.to(full_imgs.device), self.grid_size
+                    bboxes.to(device), self.grid_size
                 )
 
             else:  # "both"
@@ -564,25 +796,25 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
 
-    print("TinySteerViT 構築中 (pretrained_backbone=False)...")
-    sv = TinySteerViT(pretrained_backbone=False).to(device)
+    for ve in ("vit_tiny", "fastvit_t8", "mobilevit_xxs"):
+        print(f"\n--- vision_encoder={ve} ---")
+        sv = TinySteerViT(pretrained_backbone=False, vision_encoder=ve).to(device)
+        for name, p in sv.named_parameters():
+            p.requires_grad_(any(k in name for k in ("connector", "gated_cross_attn", "lin_seg_head")))
 
-    sv_teacher = copy.deepcopy(sv)
-    sv_teacher.eval()
-    for p in sv_teacher.parameters():
-        p.requires_grad_(False)
-    for name, p in sv.named_parameters():
-        p.requires_grad_(any(k in name for k in ("gated_cross_attn", "lin_seg_head")))
+        crit = HeatmapSoftCELoss(
+            sv=sv, sv_teacher=None,
+            grid_size=sv.grid_size, teacher_mode="bbox",
+        ).to(device)
 
-    heatmap_crit = HeatmapSoftCELoss(sv=sv, sv_teacher=sv_teacher).to(device)
+        B    = 2
+        imgs = torch.randn(B, 3, sv.img_size, sv.img_size, device=device)
+        txts = ["cat", "dog"]
+        bboxes = torch.tensor([[0.1, 0.1, 0.5, 0.5], [0.3, 0.3, 0.9, 0.9]], device=device)
 
-    B               = 4
-    dummy_full_imgs = torch.randn(B, 3, TINY_VIT_IMG_SIZE, TINY_VIT_IMG_SIZE, device=device)
-    dummy_texts     = ["cat", "dog", "person", "car"]
-
-    loss = heatmap_crit(dummy_full_imgs, dummy_texts)
-    loss.backward()
-
-    n_grad = sum(1 for p in sv.parameters() if p.requires_grad and p.grad is not None)
-    print(f"  Heatmap loss: {loss.item():.4f}  params with grad: {n_grad}")
-    print("OK ✓")
+        loss = crit(imgs, txts, bboxes=bboxes)
+        loss.backward()
+        n_grad = sum(1 for p in sv.parameters() if p.requires_grad and p.grad is not None)
+        print(f"  img={sv.img_size}px  grid={sv.grid_size}  tokens={sv.num_img_tokens}")
+        print(f"  loss={loss.item():.4f}  params with grad: {n_grad}")
+    print("\nOK ✓")

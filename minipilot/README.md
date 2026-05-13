@@ -10,22 +10,45 @@ RefCOCO / COCO を使って TinySteerViT を学習するスクリプト。
 ```
 テキスト入力
   └─ テキストエンコーダ (frozen, --text-encoder で選択)
-       └─ connector: Linear(d_text → 192)  ★学習
-            └─ GatedCrossAttn × 12  ★学習
-                 └─ vit_tiny_patch16_224 (ImageNet pretrained, frozen)
-                      └─ lin_seg_head: Linear(192 → 1)  ★学習
-                           └─ patch logits (14×14 = 196 patches)
+       └─ connector: Linear(d_text → d_vis)  ★学習
+            └─ GatedCrossAttn × n_stages  ★学習
+                 └─ ビジョンバックボーン (pretrained, frozen, --vision-encoder で選択)
+                      └─ lin_seg_head: Linear(d_vis → 1)  ★学習
+                           └─ patch logits (grid×grid patches)
 
 損失: SoftCE(student_logits, teacher_soft)
 ```
 
 | コンポーネント | パラメータ数 | 学習 |
 |--------------|------------|------|
-| ViT-Tiny backbone | ~5.7M | ✗ frozen (ImageNet pretrained) |
+| ビジョンバックボーン | 下表参照 | ✗ frozen (ImageNet pretrained) |
 | テキストエンコーダ | 下表参照 | ✗ frozen |
-| connector (d_text→192) | d_text × 192 | ✓ |
-| GatedCrossAttn × 12 | ~2.2M | ✓ |
-| lin_seg_head | ~193 | ✓ |
+| connector (d_text→d_vis) | d_text × d_vis | ✓ |
+| GatedCrossAttn × n | ~1–3M | ✓ |
+| lin_seg_head | d_vis + 1 | ✓ |
+
+---
+
+## ビジョンエンコーダ (`--vision-encoder`)
+
+`--vision-encoder` でバックボーンを切り替えられる。
+
+| キー | モデル | 入力解像度 | グリッド | `d_vis` | GCA 挿入箇所 |
+|------|--------|-----------|---------|---------|-------------|
+| `vit_tiny` (デフォルト) | `vit_tiny_patch16_224` | 224×224 | 14×14 (196) | 192 | 各 Transformer ブロック後 (×12) |
+| `fastvit_t8` | `fastvit_t8.apple_dist_in1k` | 256×256 | 8×8 (64) | 768 | 各ステージ後 (×4) |
+| `mobilevit_xxs` | `mobilevit_xxs` | 256×256 | 8×8 (64) | 320 | 各ステージ後 (×5) |
+
+- `vit_tiny`: patch token ベースの ViT。CLS トークンあり (num_prefix=1)
+- `fastvit_t8` / `mobilevit_xxs`: CNN ライクな stem+stages+final_conv 構造。CLS トークンなし (num_prefix=0)
+
+ビジョンエンコーダを変えると `connector` のサイズ (`d_text → d_vis`) と GCA 数が自動的に変わる。  
+チェックポイントに保存され、`test.py` ロード時に自動復元される。
+
+```bash
+python train.py --config config.yaml --vision-encoder fastvit_t8 --out ./ckpts_fastvit
+python train.py --config config.yaml --vision-encoder mobilevit_xxs --out ./ckpts_mobilevit
+```
 
 ---
 
@@ -163,6 +186,15 @@ python train.py --config config.yaml --text-encoder minilm-l6   --out ./ckpts_mi
 # bbox mask teacher (SteerViT 不要・高速)
 python train.py --config config.yaml --teacher bbox
 
+# ビジョンエンコーダを切り替えて学習
+python train.py --config config.yaml --vision-encoder fastvit_t8   --out ./ckpts_fastvit
+python train.py --config config.yaml --vision-encoder mobilevit_xxs --out ./ckpts_mobilevit
+
+# 教師キャッシュを使った学習 (SteerViT をロードしない)
+python precompute_teacher.py --dataset refcoco --out ./teacher_cache/refcoco       # 事前計算 (初回のみ)
+python train.py --config config.yaml --teacher-cache ./teacher_cache/refcoco       # heatmap 蒸留のみ
+python train.py --config config.yaml --teacher-cache ./teacher_cache/refcoco --attn-distil  # attn distil も
+
 # 全データセットで学習
 python train.py --config config.yaml --dataset all --batch-size 512 --teacher bbox
 ```
@@ -180,6 +212,186 @@ python train.py --config config.yaml --dataset all --batch-size 512 --teacher bb
 | batch size | 64 |
 | lr | 3e-4 (CosineAnnealing → 3e-6) |
 | optimizer | AdamW (weight_decay=1e-2) |
+
+---
+
+## SageMaker での学習 (`train_aws.py`)
+
+`train_aws.py` は `train.py` の SageMaker 対応版。  
+**Training Job としてサブミット**するか、**Notebook Instance のターミナルから直接実行**できる。
+
+### 方法 1 — Training Job (Notebook からサブミット)
+
+#### 1-1. S3 へデータをアップロード
+
+```python
+import sagemaker
+
+session = sagemaker.Session()
+bucket  = session.default_bucket()   # または任意のバケット名
+
+# ローカル → S3（大容量の場合は !aws s3 sync を推奨）
+coco_uri = session.upload_data("./data/coco", bucket=bucket, key_prefix="datasets/coco")
+vg_uri   = session.upload_data("./data/vg",   bucket=bucket, key_prefix="datasets/vg")
+gqa_uri  = session.upload_data("./data/GQA",  bucket=bucket, key_prefix="datasets/GQA")
+```
+
+ターミナルからの場合:
+
+```bash
+aws s3 sync ./data/coco s3://your-bucket/datasets/coco
+aws s3 sync ./data/vg   s3://your-bucket/datasets/vg
+aws s3 sync ./data/GQA  s3://your-bucket/datasets/GQA
+```
+
+#### 1-2. Estimator を作成してサブミット
+
+```python
+import sagemaker
+from sagemaker.pytorch import PyTorch
+
+session = sagemaker.Session()
+role    = sagemaker.get_execution_role()
+bucket  = session.default_bucket()
+
+estimator = PyTorch(
+    entry_point="train_aws.py",
+    source_dir="/home/ec2-user/SageMaker/SteerFamily/minipilot",  # ← 実際のパスに合わせる
+    requirements_file="requirements_sm.txt",
+    role=role,
+    instance_type="ml.p3.2xlarge",   # V100×1。安価なら ml.g4dn.xlarge (T4)
+    instance_count=1,
+    framework_version="2.1",
+    py_version="py310",
+    hyperparameters={
+        "dataset":    "refcoco",
+        "teacher":    "bbox",        # bbox なら SteerViT 不要・高速
+        "epochs":     50,
+        "batch-size": 64,
+        "s3-output":  f"s3://{bucket}/runs/exp01",
+    },
+    output_path=f"s3://{bucket}/runs/exp01/output",
+    base_job_name="tinysteervit",
+)
+
+estimator.fit(
+    inputs={
+        "coco": f"s3://{bucket}/datasets/coco",
+        "vg":   f"s3://{bucket}/datasets/vg",
+        "gqa":  f"s3://{bucket}/datasets/GQA",
+    },
+    wait=False,   # True にするとログをその場でストリーミング表示
+)
+
+print("Job name:", estimator.latest_training_job.name)
+```
+
+#### 1-3. モニタリング
+
+```python
+# ログをストリーミング表示（wait=False でサブミットした後から attach 可能）
+estimator.latest_training_job.wait(logs="All")
+
+# ジョブ名で別セルから attach する場合
+from sagemaker.estimator import Estimator
+job = Estimator.attach("tinysteervit-2026-xx-xx-xx-xx-xx")
+```
+
+CloudWatch Logs の `/aws/sagemaker/TrainingJobs` からも確認できる。
+
+#### 1-4. 結果の取得
+
+学習終了後、`best_model.pth` は `output_path` に `model.tar.gz` として自動保存される。
+
+```python
+print(estimator.model_data)
+# → s3://your-bucket/runs/exp01/output/tinysteervit-.../output/model.tar.gz
+
+# ローカルにダウンロード & 展開
+import boto3, tarfile
+from urllib.parse import urlparse
+
+uri    = estimator.model_data
+parsed = urlparse(uri)
+boto3.client("s3").download_file(parsed.netloc, parsed.path.lstrip("/"), "model.tar.gz")
+
+with tarfile.open("model.tar.gz") as t:
+    t.extractall("./downloaded_ckpt")
+```
+
+`--s3-output` を指定した場合は学習中にも逐次アップロードされるため、途中経過を S3 から確認できる。
+
+#### インスタンスタイプの目安
+
+| インスタンス | GPU | VRAM | 推奨用途 |
+|---|---|---|---|
+| `ml.g4dn.xlarge` | T4 ×1 | 16 GB | 動作確認・`bbox` teacher |
+| `ml.p3.2xlarge` | V100 ×1 | 16 GB | 通常の学習 |
+| `ml.p3.8xlarge` | V100 ×4 | 64 GB | `steervit` teacher・大バッチ |
+
+> `--teacher bbox` なら SteerViT のロードが不要なので `ml.g4dn.xlarge` で十分動く。
+
+#### `steervit` パッケージについて
+
+`torch` との依存競合があるため `requirements_sm.txt` には含めていない。  
+`train_aws.py` が SageMaker 環境を検出すると自動的に `--no-deps` でインストールする。  
+`--teacher bbox` を使う場合はインストール自体が不要（`steervit` はインポートされない）。
+
+SageMaker の入出力は以下のように自動マッピングされる:
+
+| SM チャンネル / 環境変数 | 対応する引数 |
+|---|---|
+| `SM_CHANNEL_COCO` | `--coco-root` |
+| `SM_CHANNEL_VG` | `--vg-root` |
+| `SM_CHANNEL_GQA` | `--gqa-root` |
+| `SM_CHANNEL_STEERVIT_CKPT` | `--steervit-ckpt` |
+| `SM_MODEL_DIR` | `--out`（チェックポイント保存先） |
+| `SM_HPS` | 全ハイパーパラメータ |
+
+ハイパーパラメータの優先順位: **CLI 引数 > SM_HPS > config.yaml > デフォルト値**
+
+### 方法 2 — Notebook Instance のターミナルから直接実行
+
+```bash
+python train_aws.py \
+    --coco-root /home/ec2-user/SageMaker/data/coco \
+    --teacher bbox \
+    --dataset refcoco \
+    --epochs 30 \
+    --s3-output s3://your-bucket/runs/exp01
+```
+
+### SteerViT チェックポイントの解決順序
+
+`--teacher steervit` または `--teacher both` のとき、以下の順で ckpt を探す:
+
+1. `--steervit-ckpt` がファイルなら直接使用
+2. ディレクトリなら内部の `*.pth` を自動検索（SM チャンネルはディレクトリで渡されるため）
+3. どちらも存在しなければ `huggingface_hub` で自動ダウンロード
+
+### `--s3-output` による S3 自動アップロード
+
+```bash
+python train_aws.py \
+    --coco-root /data/coco \
+    --teacher bbox \
+    --s3-output s3://your-bucket/runs/exp01
+```
+
+- `best_model.pth` 更新のたびに即アップロード
+- 学習完了後に `history.json` / `train.log` もアップロード
+- boto3 が必要 (`pip install boto3`)
+
+### train.py との主な違い
+
+| 項目 | train.py | train_aws.py |
+|---|---|---|
+| データパス | CLI 引数 / config.yaml | SM チャンネル → CLI 引数 → config.yaml の順で解決 |
+| ハイパーパラメータ | CLI 引数 / config.yaml | SM_HPS → CLI 引数 → config.yaml の順で解決 |
+| 出力先デフォルト | `./ckpts` | `SM_MODEL_DIR`（未設定なら `./ckpts`） |
+| SteerViT ckpt 解決 | ファイルパス直接指定のみ | ファイル / ディレクトリ / HuggingFace Hub の順 |
+| S3 アップロード | なし | `--s3-output` で best_model.pth を逐次アップロード |
+| `--num-workers` デフォルト | 8 | 4 |
 
 ---
 
@@ -241,6 +453,83 @@ attn-distil を有効にすると、通常の `--teacher steervit` に比べて�
 | Student forward の速度 | 全 12 ブロックで attention map を手動計算するため遅くなる |
 | VRAM | 全ブロックの attention map を保持するため増加 |
 
+→ 学習を高速化したい場合は **教師キャッシュ** (`precompute_teacher.py`) を使うこと。
+
+---
+
+## 教師キャッシュ (`precompute_teacher.py`)
+
+`--teacher steervit` や `--attn-distil` を使うと毎バッチ SteerViT を実行するため学習が遅くなる。  
+`precompute_teacher.py` で **SteerViT の出力を事前計算・保存**しておくと、学習中は SteerViT をロードせずにキャッシュから読むだけになる。
+
+### 保存されるファイル
+
+| ファイル | 内容 | 形状 | dtype |
+|---------|------|------|-------|
+| `soft.dat` | softmax heatmap | (N, 576) | float16 |
+| `sa.dat` | SA 注意の圧縮分布 | (N, n_blocks, 576) | float16 |
+| `ca.dat` | CA 注意の圧縮分布 | (N, n_blocks, 576) | float16 |
+| `meta.json` | メタデータ | — | JSON |
+
+`--no-attn` を付けると `sa.dat` / `ca.dat` を省略（heatmap 蒸留のみのとき推奨）。
+
+SA/CA の圧縮方法:
+- **SA**: CLS→patch 注意をヘッド平均 → 正規化 → (576,) per block
+- **CA**: patch→text 注意をヘッド平均 + テキスト平均 → 正規化 → (576,) per block
+
+### ステップ 1: キャッシュ生成
+
+```bash
+# heatmap + SA/CA を保存（--attn-distil と組み合わせる場合）
+python precompute_teacher.py \
+    --dataset refcoco \
+    --out ./teacher_cache/refcoco \
+    --split train
+
+# heatmap のみ（高速、attn distil なしで使う場合）
+python precompute_teacher.py \
+    --dataset refcoco \
+    --out ./teacher_cache/refcoco_noattn \
+    --split train \
+    --no-attn
+
+# val set も同様に
+python precompute_teacher.py --dataset refcoco --out ./teacher_cache/refcoco_val --split val
+```
+
+| オプション | デフォルト | 説明 |
+|-----------|-----------|------|
+| `--dataset` | (必須) | `refcoco` / `refcoco+` / `refcocog` / `vg` / `gqa` / `coco` |
+| `--out` | (必須) | 出力ディレクトリ |
+| `--split` | `train` | `train` / `val` |
+| `--no-attn` | off | SA/CA を保存しない (soft heatmap のみ) |
+| `--steervit-ckpt` | config | SteerViT チェックポイントパス |
+| `--batch-size` | `32` | バッチサイズ |
+| `--num-workers` | `4` | DataLoader ワーカー数 |
+
+### ステップ 2: キャッシュを使って学習
+
+```bash
+# heatmap 蒸留のみ（SteerViT をロードしない）
+python train.py --config config.yaml \
+    --dataset refcoco \
+    --teacher-cache ./teacher_cache/refcoco_noattn
+
+# attn distil もキャッシュから（SA/CA 込みで生成したキャッシュが必要）
+python train.py --config config.yaml \
+    --dataset refcoco \
+    --teacher-cache ./teacher_cache/refcoco \
+    --attn-distil
+```
+
+`--teacher-cache` を指定すると:
+- SteerViT を**ロードしない**（起動高速化・VRAM 節約）
+- `fix_text=True` でテキスト選択を決定論的にしてキャッシュと一致させる
+- バッチにサンプルインデックスを付加してキャッシュを正しく参照する
+
+> **注意**: キャッシュは **train split のみ**を対象にすること。  
+> val set は元々 SteerViT を実行しないので高速（キャッシュ不要）。
+
 ---
 
 ## オプション一覧
@@ -251,8 +540,9 @@ attn-distil を有効にすると、通常の `--teacher steervit` に比べて�
 |-----------|-----------|------|
 | `--config` | — | YAML config ファイル (CLI 引数で上書き可) |
 | `--text-encoder` | `distilroberta` | `distilroberta` / `tinybert-l6` / `tinybert-l4` / `minilm-l6` |
+| `--vision-encoder` | `vit_tiny` | `vit_tiny` / `fastvit_t8` / `mobilevit_xxs` |
 | `--teacher` | `steervit` | teacher の種類: `steervit` / `bbox` / `both` |
-| `--no-pretrained-backbone` | — | ViT-Tiny backbone も完全ランダム初期化 |
+| `--no-pretrained-backbone` | — | ビジョンバックボーンも完全ランダム初期化 |
 | `--dataset` | `refcoco` | `refcoco` / `refcoco+` / `refcocog` / `vg` / `gqa` / `coco` / `all` |
 | `--epochs` | `50` | 学習エポック数 |
 | `--batch-size` | `64` | バッチサイズ |
@@ -268,10 +558,30 @@ attn-distil を有効にすると、通常の `--teacher steervit` に比べて�
 | `--attn-weight` | `1.0` | attention distil loss 全体の重み |
 | `--sa-weight` | `1.0` | SA loss の重み |
 | `--ca-weight` | `1.0` | CA loss の重み |
+| `--teacher-cache` | — | 事前計算済み教師キャッシュのディレクトリ (`precompute_teacher.py` で生成) |
 | `--coco-root` | (config) | COCO データセットのルートパス |
 | `--vg-root` | (config) | Visual Genome のルートパス |
 | `--gqa-root` | (config) | GQA のルートパス |
 | `--steervit-ckpt` | (config) | SteerViT チェックポイントパス |
+
+### train_aws.py
+
+`train.py` の全オプションに加えて以下を追加:
+
+| オプション | デフォルト | 説明 |
+|-----------|-----------|------|
+| `--s3-output` | — | チェックポイントをアップロードする S3 URI (例: `s3://bucket/runs/exp01`) |
+
+SM 環境変数によるパス上書き（自動）:
+
+| 環境変数 | 上書き対象 |
+|---|---|
+| `SM_CHANNEL_COCO` | `--coco-root` |
+| `SM_CHANNEL_VG` | `--vg-root` |
+| `SM_CHANNEL_GQA` | `--gqa-root` |
+| `SM_CHANNEL_STEERVIT_CKPT` | `--steervit-ckpt` |
+| `SM_MODEL_DIR` | `--out` |
+| `SM_HPS` | 全ハイパーパラメータ |
 
 ### test.py
 
@@ -400,12 +710,17 @@ python test.py --config config.yaml --ckpt ./ckpts_tinyvit_all/best_model.pth --
 
 ```
 tiny_steer/
-  config.yaml   # 全パラメータ・パスのデフォルト設定
-  model.py      # GatedCrossAttn / TinyViTBackbone / TinySteerViT
-                # AttnDistilLoss / HeatmapSoftCELoss / TEXT_ENCODERS
-  dataset.py    # RefCOCOLocalDataset / COCODetDataset / VGRegionDataset
-                # GQASceneGraphDataset / build_loaders
-  train.py      # 学習スクリプト
-  train.sh      # 実行例 (各テキストエンコーダのコメントアウト例あり)
-  test.py       # CORE benchmark 評価スクリプト
+  config.yaml             # 全パラメータ・パスのデフォルト設定
+  model.py                # GatedCrossAttn / TinyViTBackbone / FastViTBackbone
+                          # MobileViTXXSBackbone / TinySteerViT / TeacherCache
+                          # AttnDistilLoss / HeatmapSoftCELoss
+                          # TEXT_ENCODERS / VISION_ENCODERS
+  dataset.py              # RefCOCOLocalDataset / COCODetDataset / VGRegionDataset
+                          # GQASceneGraphDataset / _IndexedWrapper / build_loaders
+  train.py                # 学習スクリプト (ローカル実行)
+  precompute_teacher.py   # SteerViT 教師出力の事前計算・キャッシュ生成
+  train_aws.py            # 学習スクリプト (SageMaker Training Job / Notebook Instance 対応)
+  requirements_sm.txt     # SageMaker Training Job 用 requirements (torch 除外済み)
+  train.sh                # 実行例 (各テキストエンコーダのコメントアウト例あり)
+  test.py                 # CORE benchmark 評価スクリプト
 ```

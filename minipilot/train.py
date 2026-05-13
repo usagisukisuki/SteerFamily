@@ -45,7 +45,9 @@ from dataset import build_loaders
 from model import (
     HeatmapSoftCELoss,
     TinySteerViT,
+    TeacherCache,
     TEXT_ENCODERS,
+    VISION_ENCODERS,
     STEERVIT_CKPT,
     STEERVIT_GRID,
     STEERVIT_IMG_SIZE,
@@ -285,10 +287,13 @@ def parse_args():
                    choices=["steervit", "bbox", "both"],
                    help="teacher の種類: steervit / bbox (GT bbox mask) / both (平均)")
     p.add_argument("--no-pretrained-backbone", action="store_true", default=False,
-                   help="ViT-Tiny backbone も完全ランダム初期化 (デフォルト: ImageNet pretrained)")
+                   help="vision backbone も完全ランダム初期化 (デフォルト: pretrained)")
     p.add_argument("--text-encoder", type=str, default="distilroberta",
                    choices=list(TEXT_ENCODERS),
                    help=f"テキストエンコーダ: {list(TEXT_ENCODERS)}")
+    p.add_argument("--vision-encoder", type=str, default="vit_tiny",
+                   choices=list(VISION_ENCODERS),
+                   help=f"ビジョンエンコーダ: {list(VISION_ENCODERS)}")
     # ── Data ───────────────────────────────────────────────────────────────
     p.add_argument("--dataset",      type=str,   default="refcoco",
                    choices=["refcoco", "refcoco+", "refcocog", "vg", "gqa", "coco", "all"])
@@ -313,6 +318,8 @@ def parse_args():
     p.add_argument("--vis-samples",  type=str,   default=None,
                    help="可視化 probe JSON (省略時は val set から自動選択)")
     # ── Attention distillation ────────────────────────────────────────────
+    p.add_argument("--teacher-cache", type=str, default=None,
+                   help="事前計算済み教師キャッシュのディレクトリ (precompute_teacher.py で生成)")
     p.add_argument("--attn-distil",  action="store_true", default=False,
                    help="中間ブロックの SA / CA attention map を蒸留する (steervit / both モードのみ)")
     p.add_argument("--attn-weight",  type=float, default=1.0,
@@ -335,6 +342,7 @@ def run_epoch(
     scaler:       GradScaler | None,
     device:       str,
     train:        bool,
+    with_index:   bool = False,
 ) -> float:
     sv.train(train)
     total_loss = 0.0
@@ -345,12 +353,18 @@ def run_epoch(
 
     phase = "train" if train else "val"
     pbar  = tqdm(loader, desc=phase, leave=False, dynamic_ncols=True)
-    for full_imgs, bbox_rels, texts in pbar:
+    for batch in pbar:
+        if with_index and train:
+            full_imgs, bbox_rels, texts, sample_ids = batch
+            sample_ids = sample_ids.tolist()
+        else:
+            full_imgs, bbox_rels, texts = batch
+            sample_ids = None
         full_imgs = full_imgs.to(device, non_blocking=True)
         bboxes    = bbox_rels.to(device, non_blocking=True) if need_bbox else None
 
         with autocast("cuda", enabled=(scaler is not None)):
-            loss = heatmap_crit(full_imgs, list(texts), bboxes=bboxes)
+            loss = heatmap_crit(full_imgs, list(texts), bboxes=bboxes, sample_ids=sample_ids)
 
         if train:
             optimizer.zero_grad(set_to_none=True)
@@ -381,14 +395,15 @@ def main():
 
     logger = setup_logger(out_dir)
     logger.info("=" * 60)
-    logger.info(f"Device: {DEVICE}  AMP: {args.amp}  teacher: {args.teacher}  text_encoder: {args.text_encoder}")
+    logger.info(f"Device: {DEVICE}  AMP: {args.amp}  teacher: {args.teacher}  text_encoder: {args.text_encoder}  vision_encoder: {args.vision_encoder}")
     logger.info(f"Args: {json.dumps(vars(args), ensure_ascii=False)}")
 
     # ── TinySteerViT (student) ────────────────────────────────────────────
-    logger.info(f"TinySteerViT 構築中... (text_encoder={args.text_encoder})")
+    logger.info(f"TinySteerViT 構築中... (text_encoder={args.text_encoder}, vision_encoder={args.vision_encoder})")
     sv = TinySteerViT(
         pretrained_backbone=not args.no_pretrained_backbone,
         text_encoder=args.text_encoder,
+        vision_encoder=args.vision_encoder,
     ).to(DEVICE)
 
     # 学習対象: connector / gated_cross_attn / lin_seg_head
@@ -401,8 +416,24 @@ def main():
     n_total     = sum(p.numel() for p in sv.parameters())
     logger.info(f"  学習パラメータ: {n_trainable:,} / {n_total:,}  (connector + gated_cross_attn + lin_seg_head)")
 
-    # ── SteerViT teacher (steervit / both モードのみロード) ───────────────
-    if args.teacher in ("steervit", "both"):
+    # ── Teacher cache (事前計算済みキャッシュ) ────────────────────────────
+    teacher_cache = None
+    use_cache     = False
+    if args.teacher_cache is not None:
+        teacher_cache = TeacherCache(args.teacher_cache)
+        use_cache     = True
+        logger.info(
+            f"教師キャッシュロード: {args.teacher_cache}  "
+            f"n={teacher_cache.meta['n_samples']:,}  has_attn={teacher_cache.has_attn}"
+        )
+        if args.attn_distil and not teacher_cache.has_attn:
+            logger.warning(
+                "  --attn-distil 指定だがキャッシュに SA/CA なし (--no-attn で生成)。"
+                "attn distil は無効になります。"
+            )
+
+    # ── SteerViT teacher (キャッシュ未使用かつ steervit/both モード時のみ) ─
+    if args.teacher in ("steervit", "both") and not use_cache:
         logger.info("SteerViT teacher ロード中 (frozen)...")
         from steervit.model import SteerViT
         sv_teacher = SteerViT.from_pretrained(args.steervit_ckpt, device=DEVICE)
@@ -410,14 +441,17 @@ def main():
         for p in sv_teacher.parameters():
             p.requires_grad_(False)
     else:
-        logger.info("teacher: bbox mask のみ (SteerViT はロードしない)")
+        if use_cache:
+            logger.info("教師キャッシュ使用: SteerViT はロードしません")
+        else:
+            logger.info("teacher: bbox mask のみ (SteerViT はロードしない)")
         sv_teacher = None
 
     # ── Data loaders ──────────────────────────────────────────────────────
-    logger.info(f"データローダー作成中... (full_img_size={TINY_VIT_IMG_SIZE})")
+    logger.info(f"データローダー作成中... (full_img_size={sv.img_size}  use_cache={use_cache})")
     train_loader, val_loader = build_loaders(
         dataset       = args.dataset,
-        full_img_size = TINY_VIT_IMG_SIZE,
+        full_img_size = sv.img_size,
         batch_size    = args.batch_size,
         num_workers   = args.num_workers,
         coco_root     = args.coco_root,
@@ -426,6 +460,8 @@ def main():
         max_train     = args.max_train,
         max_val       = args.max_val,
         seed          = args.seed,
+        fix_text      = use_cache,
+        with_index    = use_cache,
     )
 
     # ── Loss ──────────────────────────────────────────────────────────────
@@ -435,12 +471,13 @@ def main():
         attn_weight = 0.0
     heatmap_crit = HeatmapSoftCELoss(
         sv=sv, sv_teacher=sv_teacher,
-        grid_size=TINY_VIT_GRID, teacher_grid_size=STEERVIT_GRID,
+        grid_size=sv.grid_size, teacher_grid_size=STEERVIT_GRID,
         teacher_img_size=STEERVIT_IMG_SIZE,
         teacher_mode=args.teacher,
         attn_weight=attn_weight,
         sa_weight=args.sa_weight,
         ca_weight=args.ca_weight,
+        teacher_cache=teacher_cache,
     ).to(DEVICE)
     if attn_weight > 0:
         logger.info(
@@ -469,7 +506,7 @@ def main():
         if args.vis_samples:
             full_tf = transforms.Compose([
                 transforms.Resize(
-                    (TINY_VIT_IMG_SIZE, TINY_VIT_IMG_SIZE),
+                    (sv.img_size, sv.img_size),
                     interpolation=transforms.InterpolationMode.BICUBIC,
                 ),
                 transforms.ToTensor(),
@@ -490,7 +527,7 @@ def main():
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
 
-        train_loss = run_epoch(sv, heatmap_crit, train_loader, optimizer, scaler, DEVICE, train=True)
+        train_loss = run_epoch(sv, heatmap_crit, train_loader, optimizer, scaler, DEVICE, train=True, with_index=use_cache)
         scheduler.step()
 
         with torch.no_grad():
