@@ -14,9 +14,10 @@ paths:
 train:
   teacher:               "steervit"   # steervit | bbox | both
   text_encoder:          "distilroberta"  # distilroberta | tinybert-l6 | tinybert-l4 | minilm-l6
+  vision_encoder:        "vit_tiny"   # vit_tiny | fastvit_t8 | mobilevit_xxs
   no_pretrained_backbone: false
-  dataset:               "refcoco"    # refcoco | refcoco+ | refcocog | vg | gqa | coco | all
-  epochs:                50
+  dataset:               "all"    # refcoco | refcoco+ | refcocog | vg | gqa | coco | all
+  epochs:                30
   batch_size:            64
   lr:                    3.0e-4
   weight_decay:          1.0e-2

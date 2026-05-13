@@ -67,7 +67,8 @@ class RefCOCOLocalDataset(Dataset):
     ローカルの refcoco*/refs(unc|umd).p + instances.json から referring expression を読む。
 
     split: "train" / "val" / "testA" / "testB"
-    各サンプルで referring expression を複数持つ場合、__getitem__ のたびにランダム選択。
+    fix_text=False (デフォルト): エポックごとにランダムな referring expression を選択。
+    fix_text=True: idx ベースの決定論的選択 (teacher cache 使用時に必要)。
     """
 
     def __init__(
@@ -81,9 +82,12 @@ class RefCOCOLocalDataset(Dataset):
         max_samples:    Optional[int] = None,
         seed:           int           = 42,
         refs_filename:  Optional[str] = None,
+        fix_text:       bool          = False,
     ):
         self.full_transform = _full_img_transform(full_img_size)
         self.rng            = random.Random(seed)
+        self.seed           = seed
+        self.fix_text       = fix_text
 
         if refs_filename is None:
             refs_filename = "refs(umd).p" if "refcocog" in refcoco_dir else "refs(unc).p"
@@ -135,7 +139,10 @@ class RefCOCOLocalDataset(Dataset):
             min(float(W), x + w) / W,
             min(float(H), y + h) / H,
         ], dtype=torch.float32)
-        text = self.rng.choice(s["sents"])
+        if self.fix_text:
+            text = random.Random(self.seed + idx).choice(s["sents"])
+        else:
+            text = self.rng.choice(s["sents"])
         return self.full_transform(img), bbox_rel, text
 
 
@@ -355,6 +362,16 @@ class GQASceneGraphDataset(Dataset):
         return self.full_transform(img), bbox_rel, s["text"]
 
 
+class _IndexedWrapper(Dataset):
+    """Dataset wrapper that appends the dataset-level index to each item."""
+    def __init__(self, base: Dataset):
+        self.base = base
+    def __len__(self) -> int:
+        return len(self.base)
+    def __getitem__(self, idx: int) -> tuple:
+        return (*self.base[idx], idx)
+
+
 COCO_TRAIN_ANN  = os.path.join(COCO_ROOT, "annotations/instances_train2017.json")
 COCO_VAL_ANN    = os.path.join(COCO_ROOT, "annotations/instances_val2017.json")
 COCO_TRAIN_IMGS = os.path.join(COCO_ROOT, "train2017")
@@ -385,6 +402,8 @@ def build_loaders(
     max_train:     Optional[int] = None,
     max_val:       Optional[int] = None,
     seed:          int           = 42,
+    fix_text:      bool          = False,
+    with_index:    bool          = False,
 ):
     from torch.utils.data import DataLoader
 
@@ -396,54 +415,56 @@ def build_loaders(
     val_ann    = os.path.join(coco_root, "annotations/instances_val2017.json")
     val_imgs   = os.path.join(coco_root, "val2017")
 
+    common_kw  = dict(full_img_size=full_img_size, seed=seed)
+    refcoco_kw = {**common_kw, "fix_text": fix_text}
+
     builders = {
-        "refcoco":  lambda split, kw: RefCOCOLocalDataset(refcoco_dir=refcoco_dir,       split=split, **kw),
-        "refcoco+": lambda split, kw: RefCOCOLocalDataset(refcoco_dir=refcoco_plus_dir,  split=split, **kw),
-        "refcocog": lambda split, kw: RefCOCOLocalDataset(refcoco_dir=refcocog_dir,      split=split, **kw),
+        "refcoco":  lambda split, kw: RefCOCOLocalDataset(refcoco_dir=refcoco_dir,      coco_root=coco_root, split=split, **kw),
+        "refcoco+": lambda split, kw: RefCOCOLocalDataset(refcoco_dir=refcoco_plus_dir, coco_root=coco_root, split=split, **kw),
+        "refcocog": lambda split, kw: RefCOCOLocalDataset(refcoco_dir=refcocog_dir,     coco_root=coco_root, split=split, **kw),
         "vg":       lambda split, kw: VGRegionDataset(vg_root=vg_root,   split=split, **kw),
         "gqa":      lambda split, kw: GQASceneGraphDataset(gqa_root=gqa_root, split=split, **kw),
     }
-    all_datasets = list(builders.keys())
+    refcoco_builders = {"refcoco", "refcoco+", "refcocog"}
 
-    common_kw = dict(full_img_size=full_img_size, seed=seed)
+    def _build(name, split, max_s):
+        kw = {**(refcoco_kw if name in refcoco_builders else common_kw), "max_samples": max_s}
+        return builders[name](split, kw)
 
     if dataset == "coco":
-        train_ds = COCODetDataset(
-            ann_file=train_ann, image_dir=train_imgs,
-            max_samples=max_train, **common_kw,
-        )
-        val_ds = COCODetDataset(
-            ann_file=val_ann, image_dir=val_imgs,
-            max_samples=max_val, **common_kw,
-        )
+        train_ds = COCODetDataset(ann_file=train_ann, image_dir=train_imgs, max_samples=max_train, **common_kw)
+        val_ds   = COCODetDataset(ann_file=val_ann,   image_dir=val_imgs,   max_samples=max_val,   **common_kw)
 
     elif dataset == "all":
-        train_parts, val_parts = [], []
-        per_train = (max_train // len(all_datasets)) if max_train else None
-        per_val   = (max_val   // len(all_datasets)) if max_val   else None
-        for name in all_datasets:
-            build = builders[name]
-            train_parts.append(build("train", {**common_kw, "max_samples": per_train}))
-            val_parts.append(build("val",     {**common_kw, "max_samples": per_val}))
-        train_ds = ConcatDataset(train_parts)
-        val_ds   = ConcatDataset(val_parts)
+        all_names = list(builders.keys())
+        per_train = (max_train // len(all_names)) if max_train else None
+        per_val   = (max_val   // len(all_names)) if max_val   else None
+        train_ds  = ConcatDataset([_build(n, "train", per_train) for n in all_names])
+        val_ds    = ConcatDataset([_build(n, "val",   per_val)   for n in all_names])
 
     elif dataset in builders:
-        build    = builders[dataset]
-        train_ds = build("train", {**common_kw, "max_samples": max_train})
-        val_ds   = build("val",   {**common_kw, "max_samples": max_val})
+        train_ds = _build(dataset, "train", max_train)
+        val_ds   = _build(dataset, "val",   max_val)
 
     else:
-        raise ValueError(f"Unknown dataset: {dataset!r}. Choose from {all_datasets + ['coco', 'all']}")
+        raise ValueError(f"Unknown dataset: {dataset!r}. Choose from {list(builders.keys()) + ['coco', 'all']}")
+
+    if with_index:
+        train_ds = _IndexedWrapper(train_ds)
 
     def collate(batch):
         full_imgs, bbox_rels, texts = zip(*batch)
         return torch.stack(full_imgs), torch.stack(bbox_rels), list(texts)
 
+    def collate_with_idx(batch):
+        full_imgs, bbox_rels, texts, idxs = zip(*batch)
+        return torch.stack(full_imgs), torch.stack(bbox_rels), list(texts), torch.tensor(idxs)
+
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
         num_workers=num_workers, pin_memory=True,
-        collate_fn=collate, drop_last=True,
+        collate_fn=collate_with_idx if with_index else collate,
+        drop_last=True,
     )
     val_loader = DataLoader(
         val_ds, batch_size=batch_size, shuffle=False,
