@@ -1,0 +1,15 @@
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+torch==2.10.0+cu128
+torchvision==0.25.0+cu128
+timm>=1.0.26
+transformers>=4.57.6
+pycocotools>=2.0.11
+tqdm>=4.67.3
+matplotlib>=3.10.8
+numpy>=2.0.1
+Pillow>=11.3.0
+PyYAML>=6.0.3
+
+# steervit は torch との依存競合を避けるため以下で別途インストール:
+# pip install --no-deps git+https://github.com/JonaRuthardt/SteerViT.git@a09bc78405d8bc4f686522df2e7f35ff3e611297

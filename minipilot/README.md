@@ -1,7 +1,30 @@
-# tiny_steer
+# MiniPilot
 
-RefCOCO / COCO を使って TinySteerViT を学習するスクリプト。  
-元の SteerViT (DINOv2-base pretrained) を teacher として、vit_tiny_patch16_224 ベースの軽量モデルを知識蒸留で学習する。
+SteerViT (DINOv2-base pretrained) を teacher として軽量モデルを知識蒸留で学習するスクリプト群。  
+ビジョンエンコーダとテキストエンコーダの組み合わせで 4 つのモデルラインナップを定義する。
+
+## モデルラインナップ
+
+| 名前 | Vision Encoder | Text Encoder | グリッド | `d_vis` | パラメータ (学習対象) |
+|------|---------------|-------------|---------|---------|----------------------|
+| **MiniPilot** | DINOv3 ViT-S/16 (`dinov3_vits`) | MiniLM-L6 (`minilm-l6`) | 14×14 (196) | 384 | ~4M |
+| **NanoPilot** | ViT-Tiny/16 (`vit_tiny`) | MiniLM-L6 (`minilm-l6`) | 14×14 (196) | 192 | ~2M |
+| **PicoPilot** | FastViT-T8 (`fastvit_t8`) | MiniLM-L6 (`minilm-l6`) | 8×8 (64) | 768 | ~3M |
+| **FemtoPilot** | MobileViT-XXS (`mobilevit_xxs`) | MiniLM-L6 (`minilm-l6`) | 8×8 (64) | 320 | ~2M |
+
+```bash
+# MiniPilot
+python train.py --config config.yaml --vision-encoder dinov3_vits --text-encoder minilm-l6 --out ./ckpts_minipilot
+
+# NanoPilot
+python train.py --config config.yaml --vision-encoder vit_tiny --text-encoder minilm-l6 --out ./ckpts_nanopilot
+
+# PicoPilot
+python train.py --config config.yaml --vision-encoder fastvit_t8 --text-encoder minilm-l6 --out ./ckpts_picopilot
+
+# FemtoPilot
+python train.py --config config.yaml --vision-encoder mobilevit_xxs --text-encoder minilm-l6 --out ./ckpts_femtopilot
+```
 
 ---
 
@@ -36,6 +59,7 @@ RefCOCO / COCO を使って TinySteerViT を学習するスクリプト。
 | キー | モデル | 入力解像度 | グリッド | `d_vis` | GCA 挿入箇所 |
 |------|--------|-----------|---------|---------|-------------|
 | `vit_tiny` (デフォルト) | `vit_tiny_patch16_224` | 224×224 | 14×14 (196) | 192 | 各 Transformer ブロック後 (×12) |
+| `dinov3_vits` | `vit_small_patch16_dinov3.lvd1689m` | 224×224 | 14×14 (196) | 384 | 各 Transformer ブロック後 (×12) |
 | `fastvit_t8` | `fastvit_t8.apple_dist_in1k` | 256×256 | 8×8 (64) | 768 | 各ステージ後 (×4) |
 | `mobilevit_xxs` | `mobilevit_xxs` | 256×256 | 8×8 (64) | 320 | 各ステージ後 (×5) |
 
@@ -187,7 +211,8 @@ python train.py --config config.yaml --text-encoder minilm-l6   --out ./ckpts_mi
 python train.py --config config.yaml --teacher bbox
 
 # ビジョンエンコーダを切り替えて学習
-python train.py --config config.yaml --vision-encoder fastvit_t8   --out ./ckpts_fastvit
+python train.py --config config.yaml --vision-encoder dinov3_vits   --out ./ckpts_dinov3_vits
+python train.py --config config.yaml --vision-encoder fastvit_t8    --out ./ckpts_fastvit
 python train.py --config config.yaml --vision-encoder mobilevit_xxs --out ./ckpts_mobilevit
 
 # 教師キャッシュを使った学習 (SteerViT をロードしない)
@@ -540,7 +565,7 @@ python train.py --config config.yaml \
 |-----------|-----------|------|
 | `--config` | — | YAML config ファイル (CLI 引数で上書き可) |
 | `--text-encoder` | `distilroberta` | `distilroberta` / `tinybert-l6` / `tinybert-l4` / `minilm-l6` |
-| `--vision-encoder` | `vit_tiny` | `vit_tiny` / `fastvit_t8` / `mobilevit_xxs` |
+| `--vision-encoder` | `vit_tiny` | `vit_tiny` / `dinov3_vits` / `fastvit_t8` / `mobilevit_xxs` |
 | `--teacher` | `steervit` | teacher の種類: `steervit` / `bbox` / `both` |
 | `--no-pretrained-backbone` | — | ビジョンバックボーンも完全ランダム初期化 |
 | `--dataset` | `refcoco` | `refcoco` / `refcoco+` / `refcocog` / `vg` / `gqa` / `coco` / `all` |
@@ -583,7 +608,9 @@ SM 環境変数によるパス上書き（自動）:
 | `SM_MODEL_DIR` | `--out` |
 | `SM_HPS` | 全ハイパーパラメータ |
 
-### test.py
+### test.py / test_aws.py
+
+オプションは共通。
 
 | オプション | デフォルト | 説明 |
 |-----------|-----------|------|
@@ -596,6 +623,7 @@ SM 環境変数によるパス上書き（自動）:
 | `--num-workers` | `4` | DataLoader ワーカー数 |
 | `--no-steervit` | — | SteerViT teacher との比較をスキップ |
 | `--no-wrong-prompt` | — | Wrong-prompt 制御実験をスキップ |
+| `--log` | 自動生成 | 結果を保存する JSON ファイルパス |
 | `--coco-root` | (config) | COCO データセットのルートパス |
 | `--vg-root` | (config) | Visual Genome のルートパス |
 | `--gqa-root` | (config) | GQA のルートパス |
@@ -706,10 +734,41 @@ python test.py --config config.yaml --ckpt ./ckpts_tinyvit_all/best_model.pth --
 
 ---
 
+## AWS での評価 (`test_aws.py`)
+
+`test_aws.py` は `test.py` の SageMaker / Notebook Instance 対応版。  
+**Notebook Instance のターミナルから直接実行**することを想定している。
+
+### test.py との主な違い
+
+| 項目 | test.py | test_aws.py |
+|------|---------|-------------|
+| tqdm | 使用 | 不使用（SageMaker ログとの相性問題を回避） |
+| steervit パッケージ | 事前インストール必須 | `_install_steervit()` で自動インストール |
+| model.py の互換性 | 新版のみ (`vision_encoder` 引数あり) | 旧版・新版どちらでも動作 |
+
+### 実行例
+
+```bash
+# Notebook Instance のターミナルから実行
+cd /home/ec2-user/SageMaker/mywork/SteerFamily/minipilot
+
+python test_aws.py --ckpt ./ckpts_minilm_l6/best_model.pth \
+    --coco-root /home/ec2-user/SageMaker/mywork/dataset/coco
+
+# TinySteerViT のみ (SteerViT をスキップ)
+python test_aws.py --ckpt ./ckpts_minilm_l6/best_model.pth --no-steervit
+
+# 高速確認 (各 split 500 件)
+python test_aws.py --ckpt ./ckpts_minilm_l6/best_model.pth --max-samples 500
+```
+
+---
+
 ## ファイル構成
 
 ```
-tiny_steer/
+minipilot/
   config.yaml             # 全パラメータ・パスのデフォルト設定
   model.py                # GatedCrossAttn / TinyViTBackbone / FastViTBackbone
                           # MobileViTXXSBackbone / TinySteerViT / TeacherCache
@@ -718,9 +777,13 @@ tiny_steer/
   dataset.py              # RefCOCOLocalDataset / COCODetDataset / VGRegionDataset
                           # GQASceneGraphDataset / _IndexedWrapper / build_loaders
   train.py                # 学習スクリプト (ローカル実行)
-  precompute_teacher.py   # SteerViT 教師出力の事前計算・キャッシュ生成
   train_aws.py            # 学習スクリプト (SageMaker Training Job / Notebook Instance 対応)
+  test.py                 # CORE benchmark 評価スクリプト (ローカル実行)
+  test_aws.py             # CORE benchmark 評価スクリプト (SageMaker / Notebook Instance 対応)
+  precompute_teacher.py     # SteerViT 教師出力の事前計算・キャッシュ生成 (ローカル)
+  precompute_teacher_aws.py # 同上 (SageMaker / Notebook Instance 対応版)
+  requirements.txt        # ローカル実行用 requirements
   requirements_sm.txt     # SageMaker Training Job 用 requirements (torch 除外済み)
-  train.sh                # 実行例 (各テキストエンコーダのコメントアウト例あり)
-  test.py                 # CORE benchmark 評価スクリプト
+  train.sh                # ローカル学習の実行例
+  train_aws.sh            # AWS 学習の実行例
 ```

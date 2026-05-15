@@ -1,8 +1,10 @@
 """
-test.py - CORE Benchmark Evaluation: TinySteerViT vs SteerViT
+test_aws.py - CORE Benchmark Evaluation (SageMaker / Notebook Instance 対応版)
 
-CORE (COnditional REtrieval) ベンチマーク (SteerViT 論文 arXiv:2604.02327) の
-代替評価として RefCOCO val/testA/testB を使用する。
+test.py の AWS 対応版。以下の点が異なる:
+  - tqdm 不使用 (SageMaker ログとの相性問題を回避)
+  - steervit パッケージを自動インストール (_install_steervit)
+  - 旧 model.py (vision_encoder 引数なし) に対してフォールバック対応
 
 評価指標:
   PA   (Pointing Accuracy)     : argmax heatmap patch の中心が GT bbox 内 → hit
@@ -14,10 +16,10 @@ CORE (COnditional REtrieval) ベンチマーク (SteerViT 論文 arXiv:2604.0232
   SteerViT     : オリジナルモデル          (24×24 grid, 336px) [--no-steervit で省略可]
 
 使用例:
-  python test.py --ckpt ./ckpts_tinyvit_all/best_model.pth
-  python test.py --ckpt ./ckpts_tinyvit_all/best_model.pth --split val
-  python test.py --ckpt ./ckpts_tinyvit_all/best_model.pth --no-steervit
-  python test.py --ckpt ./ckpts_tinyvit_all/best_model.pth --max-samples 500
+  python test_aws.py --ckpt ./ckpts_minilm_l6/best_model.pth
+  python test_aws.py --ckpt ./ckpts_minilm_l6/best_model.pth --split val
+  python test_aws.py --ckpt ./ckpts_minilm_l6/best_model.pth --no-steervit
+  python test_aws.py --ckpt ./ckpts_minilm_l6/best_model.pth --max-samples 500
 """
 
 from __future__ import annotations
@@ -34,7 +36,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import transforms
-from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent))
 from dataset import (
@@ -44,7 +45,6 @@ from dataset import (
 from model import (
     TinySteerViT,
     TEXT_ENCODERS,
-    VISION_ENCODERS,
     STEERVIT_CKPT,
     STEERVIT_GRID,
     STEERVIT_IMG_SIZE,
@@ -56,6 +56,19 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 _MEAN = (0.485, 0.456, 0.406)
 _STD  = (0.229, 0.224, 0.225)
+
+
+def _install_steervit() -> None:
+    """steervit を --no-deps でインストール。既インストール済みならスキップ。"""
+    try:
+        import steervit  # noqa: F401
+    except ImportError:
+        import subprocess
+        subprocess.check_call([
+            sys.executable, "-m", "pip", "install", "--no-deps", "--quiet",
+            "git+https://github.com/JonaRuthardt/SteerViT.git"
+            "@a09bc78405d8bc4f686522df2e7f35ff3e611297",
+        ])
 
 
 # ─── Metrics ──────────────────────────────────────────────────────────────────
@@ -150,7 +163,7 @@ def evaluate(
 
     pa_w_hits = [] if wrong_prompt else None
 
-    for imgs, bbox_rels, texts in tqdm(loader, desc=desc, leave=False, dynamic_ncols=True):
+    for imgs, bbox_rels, texts in loader:
         imgs      = imgs.to(DEVICE, non_blocking=True)
         bbox_rels = bbox_rels.to(DEVICE, non_blocking=True)
         B         = imgs.shape[0]
@@ -612,15 +625,17 @@ def print_model_stats(sv, sv_teacher=None) -> None:
 # ─── Load TinySteerViT ────────────────────────────────────────────────────────
 
 def load_tiny(ckpt_path: str) -> TinySteerViT:
-    ckpt           = torch.load(ckpt_path, map_location=DEVICE, weights_only=True)
-    train_args     = ckpt.get("args", {})
-    text_encoder   = train_args.get("text_encoder", "distilroberta")
-    vision_encoder = train_args.get("vision_encoder", "vit_tiny")
+    ckpt         = torch.load(ckpt_path, map_location=DEVICE, weights_only=True)
+    train_args   = ckpt.get("args", {})
+    text_encoder = train_args.get("text_encoder", "distilroberta")
     sv = TinySteerViT(
         pretrained_backbone=True,
         text_encoder=text_encoder,
-        vision_encoder=vision_encoder,
     ).to(DEVICE)
+    if not hasattr(sv, "img_size"):
+        sv.img_size = TINY_VIT_IMG_SIZE
+    if not hasattr(sv, "grid_size"):
+        sv.grid_size = TINY_VIT_GRID
     sd = sv.state_dict()
     sd.update(ckpt["sv_state"])
     sv.load_state_dict(sd)
@@ -769,9 +784,11 @@ class _Tee:
         sys.stdout = self._stdout
         self._file.close()
 
-    # fileno は元の stdout に委譲（tqdm 等が使う）
     def fileno(self) -> int:
         return self._stdout.fileno()
+
+    def isatty(self) -> bool:
+        return self._stdout.isatty()
 
 
 def _save_log(
@@ -834,6 +851,7 @@ def main():
     sv_teacher = None
     if not args.no_steervit:
         print("\nSteerViT teacher ロード中...")
+        _install_steervit()
         from steervit.model import SteerViT
         sv_teacher = SteerViT.from_pretrained(args.steervit_ckpt, device=DEVICE)
         sv_teacher.eval()
