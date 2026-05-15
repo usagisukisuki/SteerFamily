@@ -45,6 +45,12 @@ MOBILEVIT_XXS_GRID       = 8    # 8×8 = 64 patches (stride 32 / 256px)
 MOBILEVIT_XXS_DIM        = 320  # final embed_dim (after final_conv)
 MOBILEVIT_XXS_EMBED_DIMS = (16, 24, 48, 64, 80)  # per-stage dims (5 stages)
 
+# DINOv3 ViT-S/16: 16px patch × 224px → 14×14 = 196 patches
+DINOV3_VITS_MODEL    = "vit_small_patch16_dinov3.lvd1689m"
+DINOV3_VITS_IMG_SIZE = 224
+DINOV3_VITS_GRID     = 14   # 14×14 = 196 patches (16px patch / 224px)
+DINOV3_VITS_DIM      = 384  # ViT-S embed_dim
+
 D_TEXT_DISTILROBERTA = 768   # 後方互換用
 
 # ─── Vision encoder registry ─────────────────────────────────────────────────
@@ -63,6 +69,11 @@ VISION_ENCODERS: dict[str, dict] = {
         "img_size": MOBILEVIT_XXS_IMG_SIZE,
         "grid":     MOBILEVIT_XXS_GRID,
         "dim":      MOBILEVIT_XXS_DIM,
+    },
+    "dinov3_vits": {
+        "img_size": DINOV3_VITS_IMG_SIZE,
+        "grid":     DINOV3_VITS_GRID,
+        "dim":      DINOV3_VITS_DIM,
     },
 }
 
@@ -135,22 +146,22 @@ class GatedCrossAttn(nn.Module):
         return result
 
 
-# ─── TinyViTBackbone ──────────────────────────────────────────────────────────
-class TinyViTBackbone(nn.Module):
+# ─── _ViTBackbone (共通基底: timm ViT スタイル) ──────────────────────────────
+class _ViTBackbone(nn.Module):
     """
-    vit_tiny_patch16_224 with GatedCrossAttn injected after every transformer block.
-    Interface: forward(images, text_feats, attn_mask=None) → (B, 197, 192)
+    任意の timm ViT モデルに GatedCrossAttn を各 Transformer ブロック後に挿入する共通基底。
+    num_prefix_tokens: timm が設定する値をそのまま使用 (CLS=1, register あり=1+n_reg)
+    出力: (B, num_prefix + grid**2, embed_dim)
     """
 
-    def __init__(self, pretrained: bool = True):
+    def __init__(self, model_name: str, img_size: int, pretrained: bool = True):
         super().__init__()
         import timm
         self.trunk = timm.create_model(
-            TINY_VIT_MODEL, pretrained=pretrained, num_classes=0
+            model_name, pretrained=pretrained, num_classes=0, img_size=img_size
         )
-        self.trunk.num_prefix_tokens = 1
-        d = self.trunk.embed_dim   # 192
-        n = len(self.trunk.blocks) # 12
+        d = self.trunk.embed_dim
+        n = len(self.trunk.blocks)
         self.gated_cross_attn = nn.ModuleList([
             GatedCrossAttn(d, d) for _ in range(n)
         ])
@@ -176,18 +187,38 @@ class TinyViTBackbone(nn.Module):
                 orig_fwd = block.attn.forward
                 block.attn.forward = types.MethodType(_student_sa_capture, block.attn)
                 x = block(x)
-                sa_maps.append(block.attn._captured_sa)  # keep in graph: grad flows through x to GCA
+                sa_maps.append(block.attn._captured_sa)
                 block.attn.forward = orig_fwd
                 x, ca_w = ca(x, text_feats, return_attn=True)
-                ca_maps.append(ca_w)  # keep in graph: grad trains GCA directly
+                ca_maps.append(ca_w)
             else:
                 x = block(x)
                 x = ca(x, text_feats)
 
-        x = t.norm(x)  # (B, 197, 192)
+        x = t.norm(x)
         if return_attn:
             return x, sa_maps, ca_maps
         return x
+
+
+# ─── TinyViTBackbone ──────────────────────────────────────────────────────────
+class TinyViTBackbone(_ViTBackbone):
+    """vit_tiny_patch16_224: 12 blocks, output (B, 197, 192)"""
+
+    def __init__(self, pretrained: bool = True):
+        super().__init__(TINY_VIT_MODEL, TINY_VIT_IMG_SIZE, pretrained)
+
+
+# ─── DINOv3ViTSBackbone ───────────────────────────────────────────────────────
+class DINOv3ViTSBackbone(_ViTBackbone):
+    """
+    DINOv3 ViT-S/16 distilled (vit_small_patch16_dinov3.lvd1689m): 12 blocks, output (B, 197, 384)
+    16px patch × 224px → 14×14 = 196 patch tokens + 1 CLS token
+    timm >= 1.0.20 が必要。
+    """
+
+    def __init__(self, pretrained: bool = True):
+        super().__init__(DINOV3_VITS_MODEL, DINOV3_VITS_IMG_SIZE, pretrained)
 
 
 # ─── _StemStageBackbone (共通基底: FastViT / MobileViT スタイル) ──────────────
@@ -324,6 +355,7 @@ class TinySteerViT(nn.Module):
             "vit_tiny":      TinyViTBackbone,
             "fastvit_t8":    FastViTBackbone,
             "mobilevit_xxs": MobileViTXXSBackbone,
+            "dinov3_vits":   DINOv3ViTSBackbone,
         }
         self.vision_model = _backbone_cls[vision_encoder](pretrained=pretrained_backbone)
 
